@@ -23,6 +23,9 @@ cairo-lang-filesystem.workspace = true
 cairo-lang-formatter.workspace = true
 cairo-lang-lowering.workspace = true
 cairo-lang-macro = { path = "../plugins/cairo-lang-macro" }
+proc-macro-server-api = { path = "../../cairo/crates/cairo-lang-language-server/proc-macro-server-api", features = [
+    "build-server",
+] }
 cairo-lang-macro-stable = "1"
 cairo-lang-parser.workspace = true
 cairo-lang-semantic.workspace = true
@@ -59,8 +62,11 @@ petgraph.workspace = true
 ra_ap_toolchain.workspace = true
 redb.workspace = true
 reqwest.workspace = true
+salsa.workspace = true
 scarb-build-metadata = { path = "../utils/scarb-build-metadata" }
-scarb-metadata = { path = "../scarb-metadata", default-features = false, features = ["builder"] }
+scarb-metadata = { path = "../scarb-metadata", default-features = false, features = [
+    "builder",
+] }
 scarb-stable-hash = { path = "../utils/scarb-stable-hash" }
 scarb-ui = { path = "../utils/scarb-ui" }
 semver.workspace = true
@@ -75,6 +81,7 @@ smol_str.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream = "0.1"
 toml.workspace = true
 toml_edit.workspace = true
 tracing-subscriber.workspace = true

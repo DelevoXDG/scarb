@@ -41,16 +41,7 @@ pub fn run(config: &Config) -> Result<()> {
         }
     }
 
-    config.tokio_handle().block_on(async {
-        // Listen on 0 port so OS assign free one.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        config
-            .ui()
-            .print(ValueMessage::new("server_address", &addr));
-        ops::start_proc_macro_server(suite, listener).await
-    })
+    ops::start_proc_macro_server(suite)
 }
 
 fn load_plugins(

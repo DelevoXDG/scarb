@@ -3,21 +3,16 @@ use crate::compiler::plugin::proc_macro::{
 };
 use crate::core::{Config, Package, PackageId};
 use anyhow::{ensure, Result};
-use cairo_lang_defs::ids::{ModuleItemId, TopLevelLanguageElementId};
 use cairo_lang_defs::patcher::PatchBuilder;
 use cairo_lang_defs::plugin::{
     DynGeneratedFileAuxData, GeneratedFileAuxData, MacroPlugin, MacroPluginMetadata,
     PluginGeneratedFile, PluginResult,
 };
 use cairo_lang_defs::plugin::{InlineMacroExprPlugin, InlinePluginResult, PluginDiagnostic};
-use cairo_lang_diagnostics::ToOption;
 use cairo_lang_filesystem::ids::{CodeMapping, CodeOrigin};
 use cairo_lang_filesystem::span::{TextOffset, TextSpan, TextWidth};
-use cairo_lang_macro::{
-    AuxData, Diagnostic, FullPathMarker, Severity, TokenStream, TokenStreamMetadata,
-};
+use cairo_lang_macro::{AuxData, Diagnostic, Severity, TokenStream, TokenStreamMetadata};
 use cairo_lang_semantic::db::SemanticGroup;
-use cairo_lang_semantic::items::attribute::SemanticQueryAttrs;
 use cairo_lang_semantic::plugin::PluginSuite;
 use cairo_lang_syntax::attribute::structured::{
     Attribute, AttributeArgVariant, AttributeStructurize,
@@ -33,9 +28,8 @@ use scarb_stable_hash::short_hash;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::vec::IntoIter;
-use tracing::{debug, trace_span};
 
 const FULL_PATH_MARKER_KEY: &str = "macro::full_path_marker";
 const DERIVE_ATTR: &str = "derive";
@@ -44,10 +38,15 @@ const DERIVE_ATTR: &str = "derive";
 ///
 /// This plugin decides which macro plugins (if any) should be applied to the processed AST item.
 /// It then redirects the item to the appropriate macro plugin for code expansion.
-#[derive(Debug)]
 pub struct ProcMacroHostPlugin {
-    macros: Vec<Arc<ProcMacroInstance>>,
-    full_path_markers: RwLock<HashMap<PackageId, Vec<String>>>,
+    fetch_expansion: Box<dyn Fn(String, TokenStream)>,
+}
+
+impl std::fmt::Debug for ProcMacroHostPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcMacroHostPlugin")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -120,41 +119,6 @@ impl IntoIterator for EmittedAuxData {
 }
 
 impl ProcMacroHostPlugin {
-    pub fn try_new(macros: Vec<Arc<ProcMacroInstance>>) -> Result<Self> {
-        // Validate expansions.
-        let mut expansions = macros
-            .iter()
-            .flat_map(|m| {
-                m.get_expansions()
-                    .iter()
-                    .map(|e| ProcMacroId::new(m.package_id(), e.clone()))
-                    .collect_vec()
-            })
-            .collect::<Vec<_>>();
-        expansions.sort_unstable_by_key(|e| e.expansion.name.clone());
-        ensure!(
-            expansions
-                .windows(2)
-                .all(|w| w[0].expansion.name != w[1].expansion.name),
-            "duplicate expansions defined for procedural macros: {duplicates}",
-            duplicates = expansions
-                .windows(2)
-                .filter(|w| w[0].expansion.name == w[1].expansion.name)
-                .map(|w| format!(
-                    "{} ({} and {})",
-                    w[0].expansion.name.as_str(),
-                    w[0].package_id,
-                    w[1].package_id
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        Ok(Self {
-            macros,
-            full_path_markers: RwLock::new(Default::default()),
-        })
-    }
-
     /// Find first attribute procedural macros that should be expanded.
     ///
     /// Remove the attribute from the code.
@@ -277,7 +241,7 @@ impl ProcMacroHostPlugin {
     /// Handle `#[derive(...)]` attribute.
     ///
     /// Returns a list of expansions that this plugin should apply.
-    fn parse_derive(&self, db: &dyn SyntaxGroup, item_ast: ast::ModuleItem) -> Vec<ProcMacroId> {
+    fn parse_derive(&self, db: &dyn SyntaxGroup, item_ast: ast::ModuleItem) -> Vec<Expansion> {
         let attrs = match item_ast {
             ast::ModuleItem::Struct(struct_ast) => Some(struct_ast.query_attr(db, DERIVE_ATTR)),
             ast::ModuleItem::Enum(enum_ast) => Some(enum_ast.query_attr(db, DERIVE_ATTR)),
@@ -323,7 +287,6 @@ impl ProcMacroHostPlugin {
         let token_stream =
             TokenStream::from_syntax_node(db, &item_ast).with_metadata(stream_metadata.clone());
 
-        let mut aux_data = EmittedAuxData::default();
         let mut all_diagnostics: Vec<Diagnostic> = Vec::new();
 
         // All derives to be applied.
@@ -332,22 +295,14 @@ impl ProcMacroHostPlugin {
 
         let mut derived_code = PatchBuilder::new(db, &item_ast);
         for derive in derives {
-            let result = self.instance(derive.package_id).generate_code(
-                derive.expansion.name.clone(),
+            let result = self.fetch_expantion(
+                derive.name.clone(),
                 TokenStream::empty(),
                 token_stream.clone(),
             );
 
             // Register diagnostics.
             all_diagnostics.extend(result.diagnostics);
-
-            // Register aux data.
-            if let Some(new_aux_data) = result.aux_data {
-                aux_data.push(ProcMacroAuxData::new(
-                    new_aux_data.into(),
-                    ProcMacroId::new(derive.package_id, derive.expansion.clone()),
-                ));
-            }
 
             if result.token_stream.is_empty() {
                 // No code has been generated.
@@ -375,11 +330,7 @@ impl ProcMacroHostPlugin {
                             },
                         }],
                         content: derived_code,
-                        aux_data: if aux_data.is_empty() {
-                            None
-                        } else {
-                            Some(DynGeneratedFileAuxData::new(aux_data))
-                        },
+                        aux_data: None,
                     })
                 },
                 diagnostics: into_cairo_diagnostics(all_diagnostics, stable_ptr),
@@ -416,9 +367,6 @@ impl ProcMacroHostPlugin {
                 remove_original_item: true,
             };
         }
-
-        // Full path markers require code modification.
-        self.register_full_path_markers(input.package_id, result.full_path_markers.clone());
 
         // This is a minor optimization.
         // If the expanded macro attribute is the only one that will be expanded by `ProcMacroHost`
@@ -466,12 +414,10 @@ impl ProcMacroHostPlugin {
         }
     }
 
-    fn find_expansion(&self, expansion: &Expansion) -> Option<ProcMacroId> {
-        self.macros
-            .iter()
-            .find(|m| m.get_expansions().contains(expansion))
-            .map(|m| m.package_id())
-            .map(|package_id| ProcMacroId::new(package_id, expansion.clone()))
+    fn find_expansion(&self, expansion: &Expansion) -> Option<Expansion> {
+        expansion.clone();
+
+        unimplemented!() //TODO
     }
 
     pub fn build_plugin_suite(macro_host: Arc<Self>) -> PluginSuite {
@@ -493,80 +439,6 @@ impl ProcMacroHostPlugin {
         // Register procedural macro host plugin.
         suite.add_plugin_ex(macro_host);
         suite
-    }
-
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub fn post_process(&self, db: &dyn SemanticGroup) -> Result<()> {
-        let markers = self.collect_full_path_markers(db);
-
-        let aux_data = self.collect_aux_data(db);
-        for instance in self.macros.iter() {
-            let _ = trace_span!(
-                "post_process_callback",
-                instance = %instance.package_id()
-            )
-            .entered();
-            let instance_markers = self
-                .full_path_markers
-                .read()
-                .unwrap()
-                .get(&instance.package_id())
-                .cloned()
-                .unwrap_or_default();
-            let markers_for_instance = markers
-                .iter()
-                .filter(|(key, _)| instance_markers.contains(key))
-                .map(|(key, full_path)| FullPathMarker {
-                    key: key.clone(),
-                    full_path: full_path.clone(),
-                })
-                .collect_vec();
-            let data = aux_data
-                .get(&instance.package_id())
-                .cloned()
-                .unwrap_or_default();
-            debug!("calling post processing callback with: {data:?}");
-            instance.post_process_callback(data.clone(), markers_for_instance);
-        }
-        Ok(())
-    }
-
-    fn collect_full_path_markers(&self, db: &dyn SemanticGroup) -> HashMap<String, String> {
-        let mut markers: HashMap<String, String> = HashMap::new();
-        // FULL_PATH_MARKER_KEY
-        for crate_id in db.crates() {
-            let modules = db.crate_modules(crate_id);
-            for module_id in modules.iter() {
-                let Ok(module_items) = db.module_items(*module_id) else {
-                    continue;
-                };
-                for item_id in module_items.iter() {
-                    let attr = match item_id {
-                        ModuleItemId::Struct(id) => {
-                            id.query_attr(db, FULL_PATH_MARKER_KEY).to_option()
-                        }
-                        ModuleItemId::Enum(id) => {
-                            id.query_attr(db, FULL_PATH_MARKER_KEY).to_option()
-                        }
-                        ModuleItemId::FreeFunction(id) => {
-                            id.query_attr(db, FULL_PATH_MARKER_KEY).to_option()
-                        }
-                        _ => None,
-                    };
-
-                    let keys = attr
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|attr| Self::extract_key(db, attr))
-                        .collect_vec();
-                    let full_path = item_id.full_path(db.upcast());
-                    for key in keys {
-                        markers.insert(key, full_path.clone());
-                    }
-                }
-            }
-        }
-        markers
     }
 
     fn extract_key(db: &dyn SemanticGroup, attr: Attribute) -> Option<String> {
@@ -606,22 +478,6 @@ impl ProcMacroHostPlugin {
         }
         data.into_iter()
             .into_group_map_by(|d| d.macro_id.package_id)
-    }
-
-    pub fn instance(&self, package_id: PackageId) -> &ProcMacroInstance {
-        self.macros
-            .iter()
-            .find(|m| m.package_id() == package_id)
-            .expect("procedural macro must be registered in proc macro host")
-    }
-
-    fn register_full_path_markers(&self, package_id: PackageId, markers: Vec<String>) {
-        self.full_path_markers
-            .write()
-            .unwrap()
-            .entry(package_id)
-            .and_modify(|markers| markers.extend(markers.clone()))
-            .or_insert(markers);
     }
 
     fn calculate_metadata(db: &dyn SyntaxGroup, item_ast: ast::ModuleItem) -> TokenStreamMetadata {
@@ -682,26 +538,15 @@ impl MacroPlugin for ProcMacroHostPlugin {
     }
 
     fn declared_attributes(&self) -> Vec<String> {
-        self.macros
-            .iter()
-            .flat_map(|m| m.declared_attributes())
-            .chain(vec![FULL_PATH_MARKER_KEY.to_string()])
-            .collect()
+        vec![] //TODO
     }
 
     fn declared_derives(&self) -> Vec<String> {
-        self.macros
-            .iter()
-            .flat_map(|m| m.declared_derives())
-            .map(|s| s.to_case(Case::UpperCamel))
-            .collect()
+        vec![] //TODO
     }
 
     fn executable_attributes(&self) -> Vec<String> {
-        self.macros
-            .iter()
-            .flat_map(|m| m.executable_attributes())
-            .collect()
+        vec![] //TODO
     }
 }
 
@@ -845,9 +690,5 @@ impl ProcMacroHost {
 
     pub fn into_plugin(self) -> Result<ProcMacroHostPlugin> {
         ProcMacroHostPlugin::try_new(self.macros)
-    }
-
-    pub fn macros(&self) -> &[Arc<ProcMacroInstance>] {
-        &self.macros
     }
 }

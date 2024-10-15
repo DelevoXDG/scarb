@@ -1,17 +1,9 @@
 use anyhow::Result;
-
-use cairo_lang_semantic::plugin::PluginSuite;
 use scarb::{
-    compiler::{
-        plugin::proc_macro::{ProcMacroHost, ProcMacroHostPlugin},
-        CairoCompilationUnit, CompilationUnit,
-    },
+    compiler::{plugin::proc_macro::ProcMacroHost, CairoCompilationUnit, CompilationUnit},
     core::{Config, Workspace},
     ops::{self, FeaturesOpts, FeaturesSelector},
 };
-use scarb_ui::components::ValueMessage;
-use std::sync::Arc;
-use tokio::net::TcpListener;
 
 #[tracing::instrument(skip_all, level = "info")]
 pub fn run(config: &Config) -> Result<()> {
@@ -26,7 +18,7 @@ pub fn run(config: &Config) -> Result<()> {
         &ws,
     )?;
 
-    let mut suite = PluginSuite::default();
+    let mut proc_macros = ProcMacroHost::default();
 
     for unit in compilation_units {
         match unit {
@@ -34,22 +26,19 @@ pub fn run(config: &Config) -> Result<()> {
                 ops::compile_unit(unit, &ws)?;
             }
             CompilationUnit::Cairo(unit) => {
-                suite.add(ProcMacroHostPlugin::build_plugin_suite(load_plugins(
-                    unit, &ws,
-                )?));
+                load_plugins(unit, &ws, &mut proc_macros)?;
             }
         }
     }
 
-    ops::start_proc_macro_server(suite)
+    ops::start_proc_macro_server(proc_macros)
 }
 
 fn load_plugins(
     unit: CairoCompilationUnit,
     ws: &Workspace<'_>,
-) -> Result<Arc<ProcMacroHostPlugin>> {
-    let mut proc_macros = ProcMacroHost::default();
-
+    proc_macros: &mut ProcMacroHost,
+) -> Result<()> {
     for plugin_info in unit
         .cairo_plugins
         .into_iter()
@@ -58,5 +47,5 @@ fn load_plugins(
         proc_macros.register(plugin_info.package, ws.config())?;
     }
 
-    Ok(Arc::new(proc_macros.into_plugin()?))
+    Ok(())
 }
